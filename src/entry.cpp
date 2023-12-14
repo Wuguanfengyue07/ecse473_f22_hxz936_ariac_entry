@@ -33,6 +33,8 @@
 #include <boost/thread.hpp>
 #include <cmath>
 #include <sstream>
+#include <unordered_map>
+
 
 using osrf_gear::LogicalCameraImage;
 using ArmJointState = std::array<double, 7>;
@@ -176,6 +178,31 @@ void agv2_callback(const std_msgs::StringConstPtr &msg) {
   g_agv2_state = msg->data;
 }
 
+
+void subscribeToBinTopic(
+    ros::NodeHandle& nh, 
+    int binNumber, 
+    std::array<ros::Subscriber, 6>& subscribers, 
+    std::array<LogicalCameraImage, 6>& images
+) {
+    const std::string topic = "/ariac/logical_camera_bin" + std::to_string(binNumber);
+    const ImageCallback callback = [&, binNumber](LogicalCameraPtr img) {
+        images[binNumber - 1] = *img;
+    };
+
+    subscribers[binNumber - 1] = nh.subscribe<osrf_gear::LogicalCameraImage>(topic, 16, callback);
+}
+
+
+void subscribeToTopic(ros::NodeHandle& nh, const std::string& topic, int index, 
+    std::array<ros::Subscriber, 2>& subscribers, std::array<LogicalCameraImage, 2>& images) {
+    const ImageCallback callback = [&, index](LogicalCameraPtr img) {
+        images[index] = *img;
+    };
+    subscribers[index] = nh.subscribe<osrf_gear::LogicalCameraImage>(topic, 16, callback);
+}
+
+
 int main(int argc, char **argv) {
   ros::init(argc, argv, "ariac_node");
 
@@ -208,46 +235,30 @@ int main(int argc, char **argv) {
   auto agv1_state_sub = nh.subscribe("/ariac/agv1/state", 32, agv1_callback);
   auto agv2_state_sub = nh.subscribe("/ariac/agv2/state", 32, agv2_callback);
 
-  // arrays of subsribers
+
   std::array<ros::Subscriber, 6> bin_camera_subs;
   std::array<ros::Subscriber, 2> agv_camera_subs;
   std::array<ros::Subscriber, 2> quality_camera_subs;
 
   ROS_INFO("Subscribing to bin cameras");
-  // generate subsribers to bin camera
+
   for (int i = 1; i <= 6; ++i) {
-    const std::string topic = "/ariac/logical_camera_bin" + std::to_string(i);
-
-    const ImageCallback callback = [&, i](LogicalCameraPtr img) {
-      g_bin_images[i - 1] = *img;
-    };
-
-    bin_camera_subs[i - 1] =
-        nh.subscribe<osrf_gear::LogicalCameraImage>(topic, 16, callback);
+    subscribeToBinTopic(nh, i, bin_camera_subs, g_bin_images);
   }
 
   ROS_INFO("Subscribing to agv and  quality cameras");
-  // generate subscribers for agv and quality camera
+
   for (int i = 1; i <= 2; ++i) {
-    const std::string agv_topic =
-        "/ariac/logical_camera_agv" + std::to_string(i);
-    const std::string quality_topic =
-        "/ariac/quality_control_sensor_" + std::to_string(i);
-
-    const ImageCallback agv_callback = [&, i](LogicalCameraPtr img) {
-      g_agv_images[i - 1] = *img;
-    };
-
-    const ImageCallback quality_callback = [&, i](LogicalCameraPtr img) {
-      g_quality_images[i - 1] = *img;
-    };
-
-    agv_camera_subs[i - 1] = nh.subscribe<osrf_gear::LogicalCameraImage>(
-        agv_topic, 16, agv_callback);
-
-    quality_camera_subs[i - 1] = nh.subscribe<osrf_gear::LogicalCameraImage>(
-        quality_topic, 16, quality_callback);
+      std::string agv_topic = "/ariac/logical_camera_agv" + std::to_string(i);
+      subscribeToTopic(nh, agv_topic, i - 1, agv_camera_subs, g_agv_images);
   }
+
+  for (int i = 1; i <= 2; ++i) {
+      std::string quality_topic = "/ariac/quality_control_sensor_" + std::to_string(i);
+      subscribeToTopic(nh, quality_topic, i - 1, quality_camera_subs, g_quality_images);
+  }
+
+
 
   ros::ServiceClient begin_client =
       nh.serviceClient<std_srvs::Trigger>("/ariac/start_competition");
@@ -267,7 +278,6 @@ int main(int argc, char **argv) {
   if (!start_success) {
     ROS_WARN("Competition service returned failure: %s",
              begin_comp.response.message.c_str());
-    // TODO: Should this exit?
   } else {
     ROS_INFO("Competition service called successfully: %s",
              begin_comp.response.message.c_str());
@@ -346,7 +356,7 @@ int main(int argc, char **argv) {
       camera_pose = img.pose;
       part_pose = img.models.front().pose;
 
-      // yaw_from_pose(part_pose);
+
 
       auto tf = get_robot_to_frame(camera_frame);
       tf2::doTransform(blank_pose, offset_pose, tf);
@@ -405,15 +415,12 @@ int main(int argc, char **argv) {
       tf2::doTransform(blank_pose, agv_camera_pose, tf);
       tf2::doTransform(part.pose, agv_part_pose, tray_tf);
 
-      // ROS_INFO("Attempting to place part at ");
-
-      // agv_part_pose.position.z = agv_camera_pose.position.z - 0.5;
-      // agv_part_pose.position.z = -agv_camera_pose.position.z + 0.075;
+    
       agv_part_pose.position.z += 0.05;
-      // https://bitbucket.org/osrf/ariac/wiki/2019/frame_specifications
+ 
       double end_rotation = yaw_from_pose(agv_part_pose);
 
-      // place part on agv
+
       arm.pickup_part(agv_part_pose.position, agv_camera_pose.position,
                       end_rotation, agv_id != "agv1", true, false);
 
@@ -519,16 +526,20 @@ void Arm::joint_state_callback(
   ArmJointState new_joint_state;
 
 
-  int count = 0;
-
-  for (int i = 0; i < m_urk_ordering.size(); ++i) {
-    for (int j = 0; j < msg->name.size(); ++j) {
-      if (m_urk_ordering[i] == msg->name[j]) {
-        new_joint_state[i] = msg->position[j];
-        count++;
-      }
-    }
+  std::unordered_map<std::string, int> name_to_index;
+  for (int j = 0; j < msg->name.size(); ++j) {
+      name_to_index[msg->name[j]] = j;
   }
+
+  int count = 0;
+  for (int i = 0; i < m_urk_ordering.size(); ++i) {
+      auto it = name_to_index.find(m_urk_ordering[i]);
+      if (it != name_to_index.end()) {
+          new_joint_state[i] = msg->position[it->second];
+          count++;
+      }
+  }
+
 
   if (count < m_urk_ordering.size()) {
     return;
